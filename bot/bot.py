@@ -278,9 +278,6 @@ async def _vision_message_handle_fn(
         placeholder_message = await update.message.reply_text("...")
         message = update.message.caption or update.message.text or ''
 
-        logger.error("THE MESSAGE IS: ")
-        logger.error(message)
-
         # send typing action
         await update.message.chat.send_action(action="typing")
 
