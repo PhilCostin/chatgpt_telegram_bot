@@ -4,8 +4,10 @@ import asyncio
 import traceback
 import html
 import json
+import sys
 from datetime import datetime
-import openai
+import config
+import dbs
 
 import telegram
 from telegram import (
@@ -33,9 +35,15 @@ import openai_utils
 
 import base64
 
+MAX_MESSAGES = 20
+SUMMARY_TRIGGER = 24
+SUMMARY_CHUNK = 12
+
 # setup
 db = database.Database()
 logger = logging.getLogger(__name__)
+dbs.init_db()
+
 
 user_semaphores = {}
 user_tasks = {}
@@ -64,10 +72,60 @@ To get a reply from the bot in the chat – @ <b>tag</b> it or <b>reply</b> to i
 For example: "{bot_username} write a poem about Telegram"
 """
 
-
 def split_text_into_chunks(text, chunk_size):
     for i in range(0, len(text), chunk_size):
         yield text[i:i + chunk_size]
+
+def add_message(chat_id: int, role: str, content: str):
+    with dbs.get_conn() as conn:
+        conn.execute(
+                "INSERT INTO conversations (chat_id, role, content) VALUES (?, ?, ?)",
+                (chat_id, role, content)
+        )
+
+def get_recent_messages(chat_id: int, limit: int = 20):
+    with dbs.get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT role, content
+            FROM conversations
+            WHERE chat_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (chat_id, limit)
+        ).fetchall()
+
+    # Reverse to chronological order
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+def build_response_input(chat_id: int, user_text: str):
+    history = get_recent_messages(chat_id)
+
+    input_items = []
+
+    for msg in history:
+        input_items.append({
+            "role": msg["role"],
+            "content": msg["content"]
+        })
+
+    # Append current user message
+    input_items.append({
+        "role": "user",
+        "content": user_text
+    })
+
+    return input_items
+
+def reset(update, context):
+    chat_id = update.effective_chat.id
+    with dbs.get_conn() as conn:
+        conn.execute(
+            "DELETE FROM conversations WHERE chat_id = ?",
+            (chat_id)
+        )
+    update.message.reply_text("Conversation context cleared.")
 
 
 async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
@@ -185,9 +243,9 @@ async def _vision_message_handle_fn(
     user_id = update.message.from_user.id
     current_model = db.get_user_attribute(user_id, "current_model")
 
-    if current_model != "gpt-4-vision-preview" and current_model != "gpt-4o":
+    if current_model != "gpt-4-vision-preview" and current_model != "gpt-4o" and current_model != "gpt-4o-2024-05-13":
         await update.message.reply_text(
-            "🥲 Images processing is only available for <b>gpt-4-vision-preview</b> and <b>gpt-4o</b> model. Please change your settings in /settings",
+            "🥲 Images processing is only available for <b>gpt-4-vision-preview</b>, <b>gpt-4o</b> and <b>gpt-4o-2024-05-13</b> model. Please change your settings in /settings",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -219,6 +277,9 @@ async def _vision_message_handle_fn(
         # send placeholder message to user
         placeholder_message = await update.message.reply_text("...")
         message = update.message.caption or update.message.text or ''
+
+        logger.error("THE MESSAGE IS: ")
+        logger.error(message)
 
         # send typing action
         await update.message.chat.send_action(action="typing")
@@ -323,7 +384,20 @@ async def _vision_message_handle_fn(
         raise
 
     except Exception as e:
-        error_text = f"Something went wrong during completion. Reason: {e}"
+        tbe = traceback.TracebackException.from_exception(e)
+        logger.error(f"Local {''.join(tbe.format())}")
+        f = sys.exc_info()[2].tb_frame
+        f = f.f_back
+        while f is not None:
+            tbe.stack.append(traceback.FrameSummary(
+                f.f_code.co_filename, f.f_lineno, f.f_code.co_name))
+            f = f.f_back
+
+        s = ''.join(tbe.format())
+        logger.error(f"Full {s}")
+
+
+        error_text = f"Something went wrong during completion (1). Reason: {e}, Stack Trace: {s}"
         logger.error(error_text)
         await update.message.reply_text(error_text)
         return
@@ -334,7 +408,50 @@ async def unsupport_message_handle(update: Update, context: CallbackContext, mes
     await update.message.reply_text(error_text)
     return
 
+def maybe_summarize(chat_id: int):
+    messages = dbs.get_messages_with_ids(chat_id)
+
+    if len(messages) < SUMMARY_TRIGGER:
+        return
+
+    # Exclude existing summaries from re-summarization
+    candidates = [
+        m for m in messages
+        if not m["is_summary"]
+    ]
+
+    if len(candidates) < SUMMARY_CHUNK:
+        return
+
+    to_summarize = candidates[:SUMMARY_CHUNK]
+
+    summary_text = openai_utils.summarize_messages(to_summarize)
+
+    with dbs.get_conn() as conn:
+        # Insert summary
+        conn.execute(
+            """
+            INSERT INTO conversations (chat_id, role, content, is_summary)
+            VALUES (?, 'assistant', ?, 1)
+            """,
+            (chat_id, summary_text)
+        )
+
+        # Remove summarized rows
+        conn.executemany(
+            "DELETE FROM conversations WHERE id = ?",
+            [(m["id"],) for m in to_summarize]
+        )
+
+
 async def message_handle(update: Update, context: CallbackContext, message=None, use_new_dialog_timeout=True):
+    chat_id = update.effective_chat.id
+    user_text = update.message.text
+
+    add_message(chat_id, "user", user_text)
+
+    maybe_summarize(chat_id)
+
     # check if bot was mentioned (for group chats)
     if not await is_bot_mentioned(update, context):
         return
@@ -377,6 +494,8 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             # send placeholder message to user
             placeholder_message = await update.message.reply_text("...")
 
+            logger.error("Sending error...")
+
             # send typing action
             await update.message.chat.send_action(action="typing")
 
@@ -384,7 +503,9 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
                  await update.message.reply_text("🥲 You sent <b>empty message</b>. Please, try again!", parse_mode=ParseMode.HTML)
                  return
 
-            dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+            #dialog_messages = db.get_dialog_messages(user_id, dialog_id=None)
+            # Fetch from SQLite
+            dialog_messages = build_response_input(chat_id, user_text)
             parse_mode = {
                 "html": ParseMode.HTML,
                 "markdown": ParseMode.MARKDOWN
@@ -445,7 +566,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             raise
 
         except Exception as e:
-            error_text = f"Something went wrong during completion. Reason: {e}"
+            error_text = f"Something went wrong during completion (2). Reason: {e}"
             logger.error(error_text)
             await update.message.reply_text(error_text)
             return
@@ -459,14 +580,14 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async with user_semaphores[user_id]:
-        if current_model == "gpt-4-vision-preview" or current_model == "gpt-4o" or update.message.photo is not None and len(update.message.photo) > 0:
+        if current_model == "gpt-4-vision-preview" or current_model == "gpt-4o" or current_model == "gpt-4o-2024-05-13" or update.message.photo is not None and len(update.message.photo) > 0:
 
             logger.error(current_model)
             # What is this? ^^^
 
-            if current_model != "gpt-4o" and current_model != "gpt-4-vision-preview":
+            if current_model != "gpt-4o" and current_model != "gpt-4o-2024-05-13" and current_model != "gpt-4-vision-preview":
                 current_model = "gpt-4o"
-                db.set_user_attribute(user_id, "current_model", "gpt-4o")
+                db.set_user_attribute(user_id, "current_model", current_model)
             task = asyncio.create_task(
                 _vision_message_handle_fn(update, context, use_new_dialog_timeout=use_new_dialog_timeout)
             )
@@ -544,7 +665,7 @@ async def generate_image_handle(update: Update, context: CallbackContext, messag
 
     try:
         image_urls = await openai_utils.generate_images(message, n_images=config.return_n_generated_images, size=config.image_size)
-    except openai.error.InvalidRequestError as e:
+    except BadRequestError as e:
         if str(e).startswith("Your request was rejected as a result of our safety system"):
             text = "🥲 Your request <b>doesn't comply</b> with OpenAI's usage policies.\nWhat did you write there, huh?"
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
